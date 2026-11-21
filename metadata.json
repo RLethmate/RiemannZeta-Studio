@@ -1,0 +1,6 @@
+{
+  "name": "Zeta-Observatorium",
+  "description": "Interaktives Labor zur Erforschung der Riemannschen Zeta-Funktion, ihrer nicht-trivialen Nullstellen und der Primzahlverteilung.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
