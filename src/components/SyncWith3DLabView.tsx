@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Pause, Play, RotateCcw } from 'lucide-react';
+import { Pause, Play, RotateCcw, Volume2, VolumeX, ZoomIn, ZoomOut } from 'lucide-react';
 import { cAbs, formatComplex, hardyZ, zeta } from '../math/complex';
 import type { ZetaZero } from '../math/zeros';
 import {
@@ -83,13 +83,22 @@ export function SyncWith3DLabView({
   zoom,
   onViewportChange,
 }: SyncWith3DLabViewProps) {
-  const [tCursor, setTCursor] = useState(14.1347);
+  const [tCursor, setTCursor] = useState(8.0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playSpeed, setPlaySpeed] = useState(1);
+  const [xMin, setXMin] = useState(2);
   const [xMax, setXMax] = useState(60);
+  const [yMin, setYMin] = useState<number | null>(null);
+  const [yMax, setYMax] = useState<number | null>(null);
   const [showLi, setShowLi] = useState(true);
   const [showMagnitude, setShowMagnitude] = useState(true);
   const [flashZeroIndex, setFlashZeroIndex] = useState<number | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [primeDrag, setPrimeDrag] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sustainedOscRef = useRef<OscillatorNode | null>(null);
+  const sustainedGainRef = useRef<GainNode | null>(null);
 
   const zCanvasRef = useRef<HTMLCanvasElement>(null);
   const zContainerRef = useRef<HTMLDivElement>(null);
@@ -165,6 +174,78 @@ export function SyncWith3DLabView({
     return () => observers.forEach((o) => o.disconnect());
   }, []);
 
+  // Persistent Synth Sound Effect for Traversal (Pitch bend without clicks)
+  useEffect(() => {
+    if (!soundEnabled) {
+      try {
+        sustainedGainRef.current?.gain.setValueAtTime(0, audioCtxRef.current?.currentTime || 0);
+        sustainedOscRef.current?.stop();
+        sustainedOscRef.current?.disconnect();
+        sustainedOscRef.current = null;
+      } catch {}
+      return;
+    }
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') ctx.resume();
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(220, ctx.currentTime);
+      gain.gain.setValueAtTime(0.025, ctx.currentTime);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+
+      sustainedOscRef.current = osc;
+      sustainedGainRef.current = gain;
+    } catch {}
+
+    return () => {
+      try {
+        sustainedOscRef.current?.stop();
+        sustainedOscRef.current?.disconnect();
+        sustainedOscRef.current = null;
+      } catch {}
+    };
+  }, [soundEnabled]);
+
+  const updateAudioPitch = (t: number, hardyVal: number) => {
+    if (!soundEnabled || !audioCtxRef.current || !sustainedOscRef.current) return;
+    try {
+      const ctx = audioCtxRef.current;
+      let nearZero = false;
+      for (const z of zeros) {
+        if (Math.abs(z.gamma - t) < 0.08) {
+          nearZero = true;
+          break;
+        }
+      }
+
+      const absVal = Math.min(5, Math.abs(hardyVal));
+      const targetFreq = Math.max(130, Math.min(520, 440 - absVal * 65));
+      sustainedOscRef.current.frequency.linearRampToValueAtTime(targetFreq, ctx.currentTime + 0.06);
+
+      if (nearZero) {
+        const pingOsc = ctx.createOscillator();
+        const pingGain = ctx.createGain();
+        pingOsc.type = 'sine';
+        pingOsc.frequency.setValueAtTime(880, ctx.currentTime);
+        pingOsc.frequency.setValueAtTime(1320, ctx.currentTime + 0.05);
+        pingGain.gain.setValueAtTime(0.08, ctx.currentTime);
+        pingGain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
+        pingOsc.connect(pingGain);
+        pingGain.connect(ctx.destination);
+        pingOsc.start();
+        pingOsc.stop(ctx.currentTime + 0.25);
+      }
+    } catch {}
+  };
+
   // Playback loop along critical line
   useEffect(() => {
     if (!isPlaying) return;
@@ -179,12 +260,13 @@ export function SyncWith3DLabView({
       tCursorRef.current = wrapped;
       setTCursor(wrapped);
       onViewportChange(centerRe, wrapped, zoom);
+      updateAudioPitch(wrapped, hardyZ(wrapped));
       rafId = requestAnimationFrame(tick);
     }
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [isPlaying, playSpeed, centerRe, zoom, onViewportChange]);
+  }, [isPlaying, playSpeed, centerRe, zoom, onViewportChange, soundEnabled, zeros]);
 
   // Precompute Hardy Z(t) table
   const hardyTable = useMemo(() => {
@@ -448,7 +530,6 @@ export function SyncWith3DLabView({
   // Prime Precomputed
   const primePrecomputed = useMemo(() => {
     const gridCount = 260;
-    const xMin = 2.0;
     const xs: number[] = [];
     const exactPi: number[] = [];
     const liVals: number[] = [];
@@ -496,7 +577,7 @@ export function SyncWith3DLabView({
     }
 
     return { xs, exactPi, liVals, baseR, deltas, gridCount };
-  }, [xMax, primes, gammas]);
+  }, [xMin, xMax, primes, gammas]);
 
   const riemannCurve = useMemo(() => {
     const { baseR, deltas, gridCount } = primePrecomputed;
@@ -534,31 +615,40 @@ export function SyncWith3DLabView({
     const plotW = width - padL - padR;
     const plotH = height - padT - padB;
 
-    const maxY = Math.max(
+    const autoMaxY = Math.max(
       10,
       primePrecomputed.exactPi[primePrecomputed.gridCount] * 1.12,
       primePrecomputed.liVals[primePrecomputed.gridCount] * 1.05
     );
-    const toX = (x: number) => padL + ((x - 2) / (xMax - 2)) * plotW;
-    const toY = (y: number) => padT + plotH - (Math.max(-1, y) / maxY) * plotH;
+    const effYMin = yMin ?? 0;
+    const effYMax = yMax ?? autoMaxY;
+
+    const toX = (x: number) => padL + ((x - xMin) / (xMax - xMin)) * plotW;
+    const toY = (y: number) => padT + plotH - ((y - effYMin) / (effYMax - effYMin)) * plotH;
 
     ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)';
     ctx.lineWidth = 1;
     ctx.font = '400 10px "IBM Plex Mono", monospace';
     ctx.fillStyle = '#FFFFFF';
 
-    const yStep = maxY <= 20 ? 5 : maxY <= 45 ? 10 : 15;
-    for (let y = 0; y <= maxY; y += yStep) {
+    const ySpan = effYMax - effYMin;
+    const yStep = ySpan <= 10 ? 2 : ySpan <= 30 ? 5 : ySpan <= 80 ? 10 : 20;
+    const startYTick = Math.ceil(effYMin / yStep) * yStep;
+    for (let y = startYTick; y <= effYMax; y += yStep) {
       const py = toY(y);
-      ctx.beginPath();
-      ctx.moveTo(padL, py);
-      ctx.lineTo(width - padR, py);
-      ctx.stroke();
-      ctx.fillText(y.toString(), 12, py + 3);
+      if (py >= padT && py <= height - padB) {
+        ctx.beginPath();
+        ctx.moveTo(padL, py);
+        ctx.lineTo(width - padR, py);
+        ctx.stroke();
+        ctx.fillText(y.toString(), 10, py + 3);
+      }
     }
 
-    const xStep = xMax <= 40 ? 5 : xMax <= 90 ? 10 : 20;
-    for (let x = 10; x <= xMax; x += xStep) {
+    const span = xMax - xMin;
+    const xStep = span <= 20 ? 2 : span <= 45 ? 5 : span <= 90 ? 10 : 20;
+    const startTick = Math.ceil(xMin / xStep) * xStep;
+    for (let x = startTick; x <= xMax; x += xStep) {
       const px = toX(x);
       ctx.beginPath();
       ctx.moveTo(px, padT);
@@ -611,7 +701,20 @@ export function SyncWith3DLabView({
       else ctx.lineTo(px, py);
     });
     ctx.stroke();
-  }, [primeSize, xMax, primePrecomputed, riemannCurve, primes, showLi]);
+
+    // Draw active 2D drag selection box if dragging
+    if (primeDrag) {
+      const x1 = Math.min(primeDrag.startX, primeDrag.currentX);
+      const x2 = Math.max(primeDrag.startX, primeDrag.currentX);
+      const y1 = Math.min(primeDrag.startY, primeDrag.currentY);
+      const y2 = Math.max(primeDrag.startY, primeDrag.currentY);
+      ctx.fillStyle = 'rgba(6, 182, 212, 0.22)';
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.strokeStyle = '#06B6D4';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    }
+  }, [primeSize, xMin, xMax, yMin, yMax, primePrecomputed, riemannCurve, primes, showLi, primeDrag]);
 
   const currentHardy = useMemo(() => hardyZ(tCursor), [tCursor]);
   const currentZeta = useMemo(() => zeta({ re: 0.5, im: tCursor }, 'high'), [tCursor]);
@@ -630,6 +733,66 @@ export function SyncWith3DLabView({
     setIsPlaying(false);
     setTCursor(nextT);
     onViewportChange(centerRe, nextT, zoom);
+  };
+
+  const handlePrimePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setPrimeDrag({ startX: x, startY: y, currentX: x, currentY: y });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handlePrimePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!primeDrag) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(44, Math.min(primeSize.width - 18, e.clientX - rect.left));
+    const y = Math.max(12, Math.min(primeSize.height - 24, e.clientY - rect.top));
+    setPrimeDrag((d) => (d ? { ...d, currentX: x, currentY: y } : null));
+  };
+
+  const handlePrimePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!primeDrag) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const endX = Math.max(44, Math.min(primeSize.width - 18, e.clientX - rect.left));
+    const endY = Math.max(12, Math.min(primeSize.height - 24, e.clientY - rect.top));
+    const padL = 44;
+    const padR = 18;
+    const padT = 12;
+    const padB = 24;
+    const plotW = primeSize.width - padL - padR;
+    const plotH = primeSize.height - padT - padB;
+
+    const x1Px = Math.min(primeDrag.startX, endX);
+    const x2Px = Math.max(primeDrag.startX, endX);
+    const y1Px = Math.min(primeDrag.startY, endY);
+    const y2Px = Math.max(primeDrag.startY, endY);
+
+    if (x2Px - x1Px > 12 && y2Px - y1Px > 12) {
+      const ratioX1 = (x1Px - padL) / plotW;
+      const ratioX2 = (x2Px - padL) / plotW;
+      const newXMin = Math.max(2, xMin + ratioX1 * (xMax - xMin));
+      const newXMax = Math.max(newXMin + 3, xMin + ratioX2 * (xMax - xMin));
+
+      const autoMaxY = Math.max(
+        10,
+        primePrecomputed.exactPi[primePrecomputed.gridCount] * 1.12,
+        primePrecomputed.liVals[primePrecomputed.gridCount] * 1.05
+      );
+      const effYMin = yMin ?? 0;
+      const effYMax = yMax ?? autoMaxY;
+
+      const ratioY1 = 1 - (y2Px - padT) / plotH;
+      const ratioY2 = 1 - (y1Px - padT) / plotH;
+      const newYMin = Math.max(0, effYMin + ratioY1 * (effYMax - effYMin));
+      const newYMax = Math.max(newYMin + 2, effYMin + ratioY2 * (effYMax - effYMin));
+
+      setXMin(newXMin);
+      setXMax(newXMax);
+      setYMin(newYMin);
+      setYMax(newYMax);
+    }
+    setPrimeDrag(null);
   };
 
   return (
@@ -667,14 +830,27 @@ export function SyncWith3DLabView({
             type="button"
             onClick={() => {
               setIsPlaying(false);
-              setTCursor(14.1347);
+              setTCursor(8.0);
               onSelectZero(0);
-              onViewportChange(centerRe, 14.1347, zoom);
+              onViewportChange(centerRe, 8.0, zoom);
             }}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 bg-[#07090E] px-3 py-2 text-xs font-medium text-slate-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             <span>Zurücksetzen</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setSoundEnabled((s) => !s)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+              soundEnabled
+                ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                : 'border-slate-800 bg-[#07090E] text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {soundEnabled ? <Volume2 className="h-3.5 w-3.5 text-amber-400" /> : <VolumeX className="h-3.5 w-3.5" />}
+            <span>{soundEnabled ? 'Ton an' : 'Ton aus'}</span>
           </button>
         </div>
 
@@ -859,19 +1035,63 @@ export function SyncWith3DLabView({
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 text-xs">
-              <span className="text-slate-400">x_max:</span>
+              <span className="text-slate-400">Bereich [{xMin.toFixed(0)} … {xMax}]</span>
               <input
                 type="range"
-                min={25}
-                max={140}
-                step={5}
+                min={12}
+                max={160}
+                step={2}
                 value={xMax}
-                onChange={(e) => setXMax(parseInt(e.target.value, 10))}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  setXMax(val);
+                  if (xMin >= val - 5) setXMin(Math.max(2, val - 35));
+                }}
                 className="obs-slider w-24"
               />
-              <span className="font-mono text-slate-200 tabular-nums w-7">{xMax}</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const span = Math.max(8, (xMax - xMin) * 0.75);
+                  const mid = (xMin + xMax) / 2;
+                  setXMin(Math.max(2, mid - span / 2));
+                  setXMax(Math.min(200, mid + span / 2));
+                }}
+                title="Hineinzoomen"
+                className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-800 bg-[#07090E] text-slate-300 hover:text-white cursor-pointer"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const span = Math.min(180, (xMax - xMin) * 1.35);
+                  const mid = (xMin + xMax) / 2;
+                  setXMin(Math.max(2, mid - span / 2));
+                  setXMax(Math.min(200, mid + span / 2));
+                }}
+                title="Herauszoomen"
+                className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-800 bg-[#07090E] text-slate-300 hover:text-white cursor-pointer"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setXMin(2);
+                  setXMax(60);
+                  setYMin(null);
+                  setYMax(null);
+                }}
+                title="Zoom zurücksetzen"
+                className="inline-flex h-7 px-2 items-center justify-center rounded border border-slate-800 bg-[#07090E] text-xs text-slate-300 hover:text-white cursor-pointer"
+              >
+                Reset
+              </button>
             </div>
             <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer whitespace-nowrap">
               <input
@@ -886,7 +1106,25 @@ export function SyncWith3DLabView({
         </div>
 
         <div ref={primeContainerRef} className="h-[190px] w-full">
-          <canvas ref={primeCanvasRef} className="h-full w-full block" />
+          <canvas
+            ref={primeCanvasRef}
+            onPointerDown={handlePrimePointerDown}
+            onPointerMove={handlePrimePointerMove}
+            onPointerUp={handlePrimePointerUp}
+            onPointerLeave={() => setPrimeDrag(null)}
+            onWheel={(e) => {
+              e.preventDefault();
+              const range = xMax - xMin;
+              const factor = e.deltaY < 0 ? 0.82 : 1.2;
+              const newRange = Math.max(5, Math.min(150, range * factor));
+              const mid = (xMin + xMax) / 2;
+              const nextMin = Math.max(2, mid - newRange / 2);
+              const nextMax = Math.min(200, nextMin + newRange);
+              setXMin(nextMin);
+              setXMax(nextMax);
+            }}
+            className="h-full w-full block cursor-crosshair touch-none"
+          />
         </div>
       </section>
     </div>
