@@ -690,6 +690,55 @@ export function SyncWith3DLabView({
     ctx.lineTo(toX(xMax), toY(prevCount));
     ctx.stroke();
 
+    // Primzahl-Beschriftung über jeder Treppenstufe (fester Pixelabstand zur Kurve)
+    {
+      const stemGap = 3; // Abstand Kurve -> Strichanfang
+      const stemLen = 9; // Strichlänge
+      const textGap = 2; // Abstand Strichende -> Text
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(padL, padT, plotW, plotH);
+      ctx.clip();
+      ctx.font = '500 10px "IBM Plex Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.strokeStyle = 'rgba(251, 191, 36, 0.65)';
+      ctx.lineWidth = 1;
+
+      let count = 0;
+      let lastBox: { x1: number; x2: number; y1: number; y2: number } | null = null;
+      for (const p of primes) {
+        if (p > xMax) break;
+        count += 1;
+        if (p < xMin) continue;
+        const px = toX(p);
+        const stepTop = toY(count);
+        const y0 = stepTop - stemGap;
+        const y1 = y0 - stemLen;
+        ctx.beginPath();
+        ctx.moveTo(px, y0);
+        ctx.lineTo(px, y1);
+        ctx.stroke();
+
+        const label = String(p);
+        const tw = ctx.measureText(label).width;
+        const baseline = y1 - textGap;
+        const box = { x1: px - tw / 2 - 2, x2: px + tw / 2 + 2, y1: baseline - 10, y2: baseline + 1 };
+        const overlaps =
+          lastBox !== null &&
+          box.x1 < lastBox.x2 &&
+          box.x2 > lastBox.x1 &&
+          box.y1 < lastBox.y2 &&
+          box.y2 > lastBox.y1;
+        if (!overlaps) {
+          ctx.fillStyle = '#FCD34D';
+          ctx.fillText(label, px, baseline);
+          lastBox = box;
+        }
+      }
+      ctx.restore();
+    }
+
     // Riemann pi_N(x)
     ctx.strokeStyle = '#06B6D4';
     ctx.lineWidth = 2;
@@ -908,6 +957,7 @@ export function SyncWith3DLabView({
               selectedZeroIndex={activeZeroCount > 0 ? activeZeroCount - 1 : 0}
               showStrip={true}
               showMarkers={true}
+              showAxisLabels={true}
               activeTravelerIm={tCursor}
               onHoverPoint={() => {}}
               onPinPoint={() => {}}

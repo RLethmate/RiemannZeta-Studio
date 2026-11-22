@@ -18,10 +18,106 @@ interface ComplexPlane3DProps {
   activeTravelerIm?: number;
   onHoverPoint: (pt: { re: number; im: number } | null) => void;
   onPinPoint: (pt: { re: number; im: number }) => void;
+  /** Schwebende Beschriftungen: triviale Nullstellen (−2n) und "critical line" */
+  showAxisLabels?: boolean;
 }
 
 const _mouse = new THREE.Vector2();
 const _raycaster = new THREE.Raycaster();
+
+const CAMERA_FOV = 42;
+
+interface LabelLine {
+  text: string;
+  /** Schriftgröße in CSS-Pixeln auf dem Bildschirm */
+  px: number;
+  color: string;
+  weight?: number;
+}
+
+/**
+ * Erzeugt ein Text-Sprite, das immer zur Kamera zeigt, nicht von der Fläche
+ * verdeckt wird und unabhängig vom Zoom eine feste Bildschirmgröße hat.
+ * Ankerpunkt ist die Unterkante (Label schwebt über dem Punkt).
+ */
+function createTextSprite(lines: LabelLine[], accent: string, frame = true) {
+  const ss = 3; // Supersampling für scharfe Schrift
+  const maxPx = Math.max(...lines.map((l) => l.px));
+  const padX = frame ? Math.round(maxPx * 0.55) : 3;
+  const padY = frame ? Math.round(maxPx * 0.3) : 2;
+  const gap = 2;
+  const fontFor = (l: LabelLine, scale = 1) =>
+    `${l.weight ?? 600} ${l.px * scale}px "IBM Plex Mono", ui-monospace, monospace`;
+
+  const measure = document.createElement('canvas').getContext('2d')!;
+  let textW = 0;
+  for (const l of lines) {
+    measure.font = fontFor(l, ss);
+    textW = Math.max(textW, measure.measureText(l.text).width / ss);
+  }
+  const textH = lines.reduce((s, l) => s + l.px * 1.2, 0) + gap * (lines.length - 1);
+  const cssW = Math.ceil(textW + padX * 2);
+  const cssH = Math.ceil(textH + padY * 2);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = cssW * ss;
+  canvas.height = cssH * ss;
+  const ctx = canvas.getContext('2d')!;
+  ctx.scale(ss, ss);
+
+  if (frame) {
+    const r = Math.max(3, Math.round(maxPx * 0.33));
+    ctx.beginPath();
+    ctx.roundRect(0.75, 0.75, cssW - 1.5, cssH - 1.5, r);
+    ctx.fillStyle = 'rgba(7, 9, 14, 0.82)';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = accent;
+    ctx.stroke();
+  } else {
+    // Ohne Rahmen: dunkler Schatten für Lesbarkeit auf hellen Flächen
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+    ctx.shadowBlur = 3;
+  }
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  let y = padY;
+  for (const l of lines) {
+    const lh = l.px * 1.2;
+    ctx.font = fontFor(l);
+    ctx.fillStyle = l.color;
+    ctx.fillText(l.text, cssW / 2, y + lh / 2);
+    y += lh + gap;
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    sizeAttenuation: false,
+    toneMapped: false,
+    fog: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.center.set(0.5, 0);
+  sprite.renderOrder = 10;
+  sprite.userData.cssW = cssW;
+  sprite.userData.cssH = cssH;
+  return { sprite, texture, material };
+}
+
+/** Skaliert ein Sprite (sizeAttenuation: false) auf seine Pixelgröße. */
+function applySpritePixelScale(sprite: THREE.Sprite, viewportHeightPx: number) {
+  const k = (2 * Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2))) / viewportHeightPx;
+  sprite.scale.set(sprite.userData.cssW * k, sprite.userData.cssH * k, 1);
+}
 
 function phaseRgbFloat(re: number, im: number): [number, number, number] {
   if (!Number.isFinite(re) || !Number.isFinite(im)) return [0.97, 0.98, 0.99];
@@ -73,6 +169,7 @@ export function ComplexPlane3D({
   activeTravelerIm,
   onHoverPoint,
   onPinPoint,
+  showAxisLabels = false,
 }: ComplexPlane3DProps) {
   const mountRef = useRef<HTMLDivElement>(null);
 
@@ -97,6 +194,7 @@ export function ComplexPlane3D({
     heightMode,
     showWireframe,
     mouseAction,
+    showAxisLabels,
   });
   propsRef.current = {
     centerRe,
@@ -113,6 +211,7 @@ export function ComplexPlane3D({
     heightMode,
     showWireframe,
     mouseAction,
+    showAxisLabels,
   };
 
   const rebuildSurfaceRef = useRef<(() => void) | null>(null);
@@ -171,7 +270,7 @@ export function ComplexPlane3D({
 
     const width = container.clientWidth || 800;
     const height = container.clientHeight || 520;
-    const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 250);
+    const camera = new THREE.PerspectiveCamera(CAMERA_FOV, width / height, 0.1, 250);
     camera.position.set(-0.5, 9.5, 16.0);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -213,6 +312,58 @@ export function ComplexPlane3D({
     let surfaceMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial> | null = null;
     const disposableGeometries: THREE.BufferGeometry[] = [];
     const disposableMaterials: THREE.Material[] = [];
+    const disposableTextures: THREE.Texture[] = [];
+    const labelSprites: THREE.Sprite[] = [];
+    let viewportHeightPx = height;
+
+    function addLabel(
+      lines: LabelLine[],
+      accent: string,
+      pos: THREE.Vector3,
+      center: [number, number] = [0.5, 0],
+      frame = true
+    ) {
+      const { sprite, texture, material } = createTextSprite(lines, accent, frame);
+      sprite.center.set(center[0], center[1]);
+      disposableTextures.push(texture);
+      disposableMaterials.push(material);
+      sprite.position.copy(pos);
+      applySpritePixelScale(sprite, viewportHeightPx);
+      labelSprites.push(sprite);
+      overlayGroup.add(sprite);
+      return sprite;
+    }
+
+    // Label, das sich auf dem Bildschirm parallel zu einer 3D-Linie ausrichtet
+    let alignedLabel: { sprite: THREE.Sprite; a: THREE.Vector3; b: THREE.Vector3 } | null = null;
+    const _pa = new THREE.Vector3();
+    const _pb = new THREE.Vector3();
+
+    function updateAlignedLabel() {
+      if (!alignedLabel) return;
+      camera.updateMatrixWorld();
+      _pa.copy(alignedLabel.a).project(camera);
+      _pb.copy(alignedLabel.b).project(camera);
+      const w = renderer.domElement.clientWidth || 1;
+      const h = renderer.domElement.clientHeight || 1;
+      const dx = (_pb.x - _pa.x) * w;
+      const dy = (_pb.y - _pa.y) * h;
+      if (Math.hypot(dx, dy) < 1e-6) return;
+      let angle = Math.atan2(dy, dx);
+      // Text nie auf dem Kopf darstellen
+      if (angle > Math.PI / 2) angle -= Math.PI;
+      else if (angle < -Math.PI / 2) angle += Math.PI;
+      (alignedLabel.sprite.material as THREE.SpriteMaterial).rotation = angle;
+    }
+
+    function addStem(x: number, y0: number, y1: number, z: number, mat: THREE.Material) {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(x, y0, z),
+        new THREE.Vector3(x, y1, z),
+      ]);
+      disposableGeometries.push(geo);
+      overlayGroup.add(new THREE.Line(geo, mat));
+    }
 
     // Probe sphere for live hover inspection
     const probeGeo = new THREE.SphereGeometry(0.11, 20, 20);
@@ -278,6 +429,7 @@ export function ComplexPlane3D({
         if (disposed) return;
         renderDirty = false;
         controls.update();
+        updateAlignedLabel();
         renderer.render(scene, camera);
         const done = () => {
           renderBusy = false;
@@ -315,8 +467,14 @@ export function ComplexPlane3D({
       }
       for (const g of disposableGeometries) g.dispose();
       for (const m of disposableMaterials) m.dispose();
+      for (const t of disposableTextures) t.dispose();
       disposableGeometries.length = 0;
       disposableMaterials.length = 0;
+      disposableTextures.length = 0;
+      labelSprites.length = 0;
+      alignedLabel = null;
+
+      const labelsVisible = propsRef.current.showAxisLabels;
 
       const {
         centerRe: cRe,
@@ -438,6 +596,23 @@ export function ComplexPlane3D({
             const traceGeo = new THREE.BufferGeometry().setFromPoints(tracePts);
             disposableGeometries.push(traceGeo);
             overlayGroup.add(new THREE.Line(traceGeo, lineMatCyan));
+
+            // Label "critical line" unterhalb der Ebene, entlang der Linie ausgerichtet
+            if (labelsVisible) {
+              const anchorZ = halfIm * 0.55; // vorderer Bereich (zur Kamera hin)
+              const sprite = addLabel(
+                [{ text: 'critical line', px: 9, color: '#67e8f9', weight: 600 }],
+                '#06b6d4',
+                new THREE.Vector3(wx, -0.04, anchorZ),
+                [0.5, 1], // Oberkante mittig an der Linie: Text verläuft parallel daneben
+                false
+              );
+              alignedLabel = {
+                sprite,
+                a: new THREE.Vector3(wx, 0, anchorZ + 0.5),
+                b: new THREE.Vector3(wx, 0, anchorZ - 0.5),
+              };
+            }
           }
         }
       }
@@ -481,11 +656,29 @@ export function ComplexPlane3D({
 
         // Trivial zeros s = -2, -4, ...
         if (0 >= cIm - halfIm && 0 <= cIm + halfIm) {
+          const trivialStemMat = new THREE.LineBasicMaterial({
+            color: 0xcbd5e1,
+            transparent: true,
+            opacity: 0.6,
+            depthTest: false,
+          });
+          disposableMaterials.push(trivialStemMat);
           for (let k = -2; k >= Math.floor(cRe - halfRe); k -= 2) {
             if (k > cRe + halfRe) continue;
             const m = new THREE.Mesh(sphereGeo, trivialMat);
             m.position.set(k - cRe, 0.02, cIm);
             overlayGroup.add(m);
+
+            // Schwebender Achsenwert über der trivialen Nullstelle
+            if (labelsVisible) {
+              const labelY = 0.8;
+              addStem(k - cRe, 0.02, labelY, cIm, trivialStemMat);
+              addLabel(
+                [{ text: `−${-k}`, px: 10, color: '#f1f5f9', weight: 600 }],
+                '#94a3b8',
+                new THREE.Vector3(k - cRe, labelY, cIm)
+              );
+            }
           }
         }
 
@@ -659,6 +852,8 @@ export function ComplexPlane3D({
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
         renderer.setSize(w, h);
+        viewportHeightPx = h;
+        for (const s of labelSprites) applySpritePixelScale(s, h);
         requestRender();
       }
     });
@@ -684,6 +879,7 @@ export function ComplexPlane3D({
 
       for (const g of disposableGeometries) g.dispose();
       for (const m of disposableMaterials) m.dispose();
+      for (const t of disposableTextures) t.dispose();
       surfaceMaterial.dispose();
       probeGeo.dispose();
       probeMat.dispose();
@@ -698,7 +894,7 @@ export function ComplexPlane3D({
   // Trigger rebuild when domain, overlays, or scale change
   useEffect(() => {
     rebuildSurfaceRef.current?.();
-  }, [centerRe, centerIm, zoom, zeros, selectedZeroIndex, showStrip, showMarkers, heightMode, showWireframe]);
+  }, [centerRe, centerIm, zoom, zeros, selectedZeroIndex, showStrip, showMarkers, heightMode, showWireframe, showAxisLabels]);
 
   useEffect(() => {
     updateTravelerRef.current?.();
