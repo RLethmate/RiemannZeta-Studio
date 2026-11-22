@@ -5,6 +5,13 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Relative Pfade, damit die App unter https://<user>.github.io/RiemannZeta-Studio/ funktioniert
+    base: './',
+    build: {
+      // GitHub Pages: "Deploy from a branch" -> main /docs
+      outDir: 'docs',
+      emptyOutDir: true,
+    },
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
